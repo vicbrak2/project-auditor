@@ -1,114 +1,276 @@
 #!/usr/bin/env python3
 """
 project-auditor — Analiza un proyecto y genera un vault de Obsidian.
+v2: análisis AST para complejidad ciclomática, imports circulares,
+    God Classes, llamadas bloqueantes en async y grafo de módulos.
 
 Uso:
-    python auditor.py <ruta-proyecto> [--output <ruta-vault>]
-
-Ejemplo:
-    python auditor.py ../brain-omni --output ./vault-brain-omni
+    python auditor.py <ruta-proyecto> [--output <ruta-vault>] [--json]
 """
 
 import os
 import re
 import sys
+import ast
 import json
 import argparse
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-# ─────────────────────────────────────────────
-# Configuración
-# ─────────────────────────────────────────────
-
+# ── Configuración ──────────────────────────────────────────
 IGNORED_DIRS = {
     ".git", ".github", "node_modules", "__pycache__", ".venv", "venv",
     "env", ".env", "dist", "build", ".next", ".nuxt", "coverage",
     ".pytest_cache", ".mypy_cache", ".tox",
 }
-
 CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",
     ".rb", ".php", ".cs", ".cpp", ".c", ".h", ".swift", ".kt",
     ".sh", ".bash", ".sql",
 }
-
-SIZE_ALERT_KB = 500  # archivos > 500KB se marcan
+SIZE_ALERT_KB = 500
 TODO_PATTERN = re.compile(r"\b(TODO|FIXME|HACK|XXX|BUG|TEMP)\b", re.IGNORECASE)
 
+# Umbrales AST
+COMPLEXITY_THRESHOLD = 10
+FUNCTION_LINES_THRESHOLD = 50
+GOD_CLASS_METHODS = 15
+BLOCKING_CALLS = {"sleep", "get", "post", "put", "delete", "request"}
+BLOCKING_MODULES = {"time", "requests", "urllib", "httplib"}
 
-# ─────────────────────────────────────────────
-# Detección de problemas
-# ─────────────────────────────────────────────
 
+# ── Visitadores AST ───────────────────────────────────────
+class ComplexityVisitor(ast.NodeVisitor):
+    """Complejidad ciclomática por función."""
+
+    def __init__(self):
+        self.results = []  # [(nombre, linea, complejidad)]
+        self._stack = []
+
+    def _enter(self, name, lineno):
+        self._stack.append({"name": name, "lineno": lineno, "complexity": 1})
+
+    def _exit(self):
+        e = self._stack.pop()
+        self.results.append((e["name"], e["lineno"], e["complexity"]))
+
+    def _inc(self):
+        if self._stack:
+            self._stack[-1]["complexity"] += 1
+
+    def visit_FunctionDef(self, node):
+        self._enter(node.name, node.lineno)
+        self.generic_visit(node)
+        self._exit()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_If(self, node):         self._inc(); self.generic_visit(node)
+    def visit_For(self, node):        self._inc(); self.generic_visit(node)
+    def visit_While(self, node):      self._inc(); self.generic_visit(node)
+    def visit_ExceptHandler(self, n): self._inc(); self.generic_visit(n)
+    def visit_BoolOp(self, node):     self._inc(); self.generic_visit(node)
+
+    def visit_comprehension(self, node):
+        if node.ifs:
+            self._inc()
+        self.generic_visit(node)
+
+
+class ImportVisitor(ast.NodeVisitor):
+    """Extrae módulos importados."""
+
+    def __init__(self):
+        self.imports = set()
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.imports.add(alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node):
+        if node.module:
+            self.imports.add(node.module.split(".")[0])
+
+
+class GodClassVisitor(ast.NodeVisitor):
+    """Detecta clases con demasiados métodos."""
+
+    def __init__(self):
+        self.results = []  # [(nombre, linea, n_metodos)]
+
+    def visit_ClassDef(self, node):
+        methods = [
+            n for n in ast.walk(node)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        self.results.append((node.name, node.lineno, len(methods)))
+        self.generic_visit(node)
+
+
+class AsyncBlockingVisitor(ast.NodeVisitor):
+    """Detecta llamadas bloqueantes en funciones async."""
+
+    def __init__(self):
+        self.results = []  # [(func_name, linea, llamada)]
+        self._async_stack = []
+
+    def visit_AsyncFunctionDef(self, node):
+        self._async_stack.append(node.name)
+        self.generic_visit(node)
+        self._async_stack.pop()
+
+    def visit_Call(self, node):
+        if self._async_stack and isinstance(node.func, ast.Attribute):
+            if (node.func.attr in BLOCKING_CALLS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in BLOCKING_MODULES):
+                self.results.append((
+                    self._async_stack[-1],
+                    node.lineno,
+                    f"{node.func.value.id}.{node.func.attr}()",
+                ))
+        self.generic_visit(node)
+
+
+class FunctionLengthVisitor(ast.NodeVisitor):
+    """Detecta funciones largas."""
+
+    def __init__(self):
+        self.results = []  # [(nombre, linea, longitud)]
+
+    def visit_FunctionDef(self, node):
+        length = getattr(node, "end_lineno", node.lineno) - node.lineno + 1
+        self.results.append((node.name, node.lineno, length))
+        self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
+# ── Análisis AST por archivo ───────────────────────────────
+def analyze_python_file(fpath: Path) -> dict:
+    """Analiza un archivo .py con AST y retorna métricas."""
+    try:
+        source = fpath.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(source, filename=str(fpath))
+    except SyntaxError:
+        return {"error": "SyntaxError", "imports": set()}
+
+    cv  = ComplexityVisitor();      cv.visit(tree)
+    gcv = GodClassVisitor();        gcv.visit(tree)
+    abv = AsyncBlockingVisitor();   abv.visit(tree)
+    flv = FunctionLengthVisitor();  flv.visit(tree)
+    iv  = ImportVisitor();          iv.visit(tree)
+
+    return {
+        "imports": iv.imports,
+        "complexity": cv.results,
+        "god_classes": gcv.results,
+        "blocking_async": abv.results,
+        "function_lengths": flv.results,
+    }
+
+
+# ── Grafo de imports ────────────────────────────────────────
+def build_import_graph(root: Path) -> dict[str, set[str]]:
+    """Grafo {modulo_largo: {módulos_locales_que_importa}}."""
+    local_modules: dict[str, Path] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+        for fname in filenames:
+            if fname.endswith(".py"):
+                fpath = Path(dirpath) / fname
+                rel = fpath.relative_to(root)
+                mod_long = str(rel.with_suffix("")).replace(os.sep, ".")
+                local_modules[mod_long] = fpath
+                local_modules[fname[:-3]] = fpath  # nombre corto
+
+    graph: dict[str, set[str]] = {}
+    for mod_name, fpath in local_modules.items():
+        if "." not in mod_name:   # solo claves largas
+            continue
+        metrics = analyze_python_file(fpath)
+        imported = metrics.get("imports", set())
+        graph[mod_name] = imported & set(local_modules.keys())
+
+    return graph
+
+
+def find_circular_imports(graph: dict[str, set[str]]) -> list[list[str]]:
+    """Detecta ciclos en el grafo de imports (DFS)."""
+    visited: set[str] = set()
+    rec_stack: set[str] = set()
+    cycles: list[list[str]] = []
+
+    def dfs(node: str, path: list[str]):
+        visited.add(node)
+        rec_stack.add(node)
+        path.append(node)
+        for neighbor in graph.get(node, set()):
+            if neighbor not in visited:
+                dfs(neighbor, path)
+            elif neighbor in rec_stack:
+                idx = path.index(neighbor)
+                cycles.append(path[idx:] + [neighbor])
+        path.pop()
+        rec_stack.discard(node)
+
+    for node in graph:
+        if node not in visited:
+            dfs(node, [])
+    return cycles
+
+
+# ── Chequeos clásicos ─────────────────────────────────────────
 def check_missing_files(root: Path) -> list[dict]:
-    """Detecta archivos importantes que faltan."""
     issues = []
     expected = {
-        "README.md": "Documentación principal del proyecto",
-        ".gitignore": "Control de archivos ignorados por Git",
+        "README.md": "Documentación principal",
+        ".gitignore": "Archivos ignorados por Git",
     }
-    # Detecta tipo de proyecto y agrega chequeos específicos
     if (root / "package.json").exists():
-        expected["package-lock.json"] = "Lockfile de dependencias Node"
+        expected["package-lock.json"] = "Lockfile Node"
     if any(root.glob("*.py")):
         expected["requirements.txt"] = "Dependencias Python"
-
     for fname, desc in expected.items():
         if not (root / fname).exists():
-            issues.append({
-                "tipo": "archivo-faltante",
-                "severidad": "alta",
-                "archivo": fname,
-                "descripcion": f"Falta `{fname}`: {desc}",
-            })
+            issues.append({"tipo": "archivo-faltante", "severidad": "alta",
+                           "archivo": fname, "descripcion": f"Falta `{fname}`: {desc}"})
     return issues
 
 
 def check_empty_dirs(root: Path) -> list[dict]:
-    """Detecta directorios vacíos."""
     issues = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         dp = Path(dirpath)
         if dp == root:
             continue
-        visible_files = [f for f in filenames if not f.startswith(".")]
-        visible_subdirs = [d for d in dirnames if d not in IGNORED_DIRS]
-        if not visible_files and not visible_subdirs:
-            issues.append({
-                "tipo": "directorio-vacio",
-                "severidad": "baja",
-                "archivo": str(dp.relative_to(root)),
-                "descripcion": f"Directorio vacío: `{dp.relative_to(root)}`",
-            })
+        if not [f for f in filenames if not f.startswith(".")] and not dirnames:
+            issues.append({"tipo": "directorio-vacio", "severidad": "baja",
+                           "archivo": str(dp.relative_to(root)),
+                           "descripcion": f"Directorio vacío: `{dp.relative_to(root)}`"})
     return issues
 
 
 def check_large_files(root: Path) -> list[dict]:
-    """Detecta archivos muy grandes."""
     issues = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for fname in filenames:
             fpath = Path(dirpath) / fname
             try:
-                size_kb = fpath.stat().st_size / 1024
-                if size_kb > SIZE_ALERT_KB:
-                    issues.append({
-                        "tipo": "archivo-grande",
-                        "severidad": "media",
-                        "archivo": str(fpath.relative_to(root)),
-                        "descripcion": f"Archivo grande ({size_kb:.0f} KB): `{fpath.relative_to(root)}`",
-                    })
+                kb = fpath.stat().st_size / 1024
+                if kb > SIZE_ALERT_KB:
+                    issues.append({"tipo": "archivo-grande", "severidad": "media",
+                                   "archivo": str(fpath.relative_to(root)),
+                                   "descripcion": f"Archivo grande ({kb:.0f} KB): `{fpath.relative_to(root)}`"})
             except OSError:
                 pass
     return issues
 
 
 def check_todos(root: Path) -> list[dict]:
-    """Detecta comentarios TODO/FIXME en el código."""
     issues = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
@@ -117,60 +279,129 @@ def check_todos(root: Path) -> list[dict]:
             if fpath.suffix not in CODE_EXTENSIONS:
                 continue
             try:
-                lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
-                for i, line in enumerate(lines, 1):
-                    m = TODO_PATTERN.search(line)
-                    if m:
-                        issues.append({
-                            "tipo": "todo-pendiente",
-                            "severidad": "media",
-                            "archivo": str(fpath.relative_to(root)),
-                            "descripcion": f"`{fpath.relative_to(root)}:{i}` — {line.strip()}",
-                        })
+                for i, line in enumerate(
+                    fpath.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+                ):
+                    if TODO_PATTERN.search(line):
+                        issues.append({"tipo": "todo-pendiente", "severidad": "media",
+                                       "archivo": str(fpath.relative_to(root)),
+                                       "descripcion": f"`{fpath.relative_to(root)}:{i}` — {line.strip()}"})
             except OSError:
                 pass
     return issues
 
 
 def check_no_tests(root: Path) -> list[dict]:
-    """Detecta proyectos sin directorio de tests."""
     test_dirs = ["tests", "test", "__tests__", "spec", "specs"]
-    test_files = list(root.glob("test_*.py")) + list(root.glob("*_test.py")) + list(root.glob("**/*.test.js"))
-    has_tests = any((root / d).is_dir() for d in test_dirs) or bool(test_files)
-    if not has_tests:
-        return [{
-            "tipo": "sin-tests",
-            "severidad": "alta",
-            "archivo": ".",
-            "descripcion": "No se encontró ningún directorio ni archivo de tests",
-        }]
+    test_files = list(root.glob("test_*.py")) + list(root.glob("*_test.py"))
+    if not any((root / d).is_dir() for d in test_dirs) and not test_files:
+        return [{"tipo": "sin-tests", "severidad": "alta", "archivo": ".",
+                 "descripcion": "No se encontró ningún directorio ni archivo de tests"}]
     return []
 
 
-def scan_project(root: Path) -> dict:
-    """Ejecuta todos los chequeos y retorna el informe."""
+# ── Chequeos AST ───────────────────────────────────────────
+def _iter_py(root: Path):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+        for fname in filenames:
+            if fname.endswith(".py"):
+                yield Path(dirpath) / fname
+
+
+def check_complexity(root: Path) -> list[dict]:
     issues = []
-    issues += check_missing_files(root)
-    issues += check_empty_dirs(root)
-    issues += check_large_files(root)
-    issues += check_todos(root)
-    issues += check_no_tests(root)
+    for fpath in _iter_py(root):
+        m = analyze_python_file(fpath)
+        if "error" in m:
+            continue
+        for name, lineno, complexity in m["complexity"]:
+            if complexity > COMPLEXITY_THRESHOLD:
+                issues.append({
+                    "tipo": "complejidad-alta", "severidad": "media",
+                    "archivo": str(fpath.relative_to(root)),
+                    "descripcion": (
+                        f"`{fpath.relative_to(root)}:{lineno}` — "
+                        f"función `{name}` complejidad {complexity} "
+                        f"(umbral {COMPLEXITY_THRESHOLD})"
+                    ),
+                })
+    return issues
 
-    # Estructura de directorios
-    structure = build_structure(root)
 
-    return {
-        "proyecto": root.name,
-        "ruta": str(root.resolve()),
-        "fecha": datetime.now().isoformat(timespec="seconds"),
-        "total_issues": len(issues),
-        "issues": issues,
-        "estructura": structure,
-    }
+def check_god_classes(root: Path) -> list[dict]:
+    issues = []
+    for fpath in _iter_py(root):
+        m = analyze_python_file(fpath)
+        if "error" in m:
+            continue
+        for class_name, lineno, n in m["god_classes"]:
+            if n > GOD_CLASS_METHODS:
+                issues.append({
+                    "tipo": "god-class", "severidad": "media",
+                    "archivo": str(fpath.relative_to(root)),
+                    "descripcion": (
+                        f"`{fpath.relative_to(root)}:{lineno}` — "
+                        f"clase `{class_name}` tiene {n} métodos "
+                        f"(umbral {GOD_CLASS_METHODS})"
+                    ),
+                })
+    return issues
 
 
+def check_blocking_async(root: Path) -> list[dict]:
+    issues = []
+    for fpath in _iter_py(root):
+        m = analyze_python_file(fpath)
+        if "error" in m:
+            continue
+        for func_name, lineno, call in m["blocking_async"]:
+            issues.append({
+                "tipo": "async-bloqueante", "severidad": "alta",
+                "archivo": str(fpath.relative_to(root)),
+                "descripcion": (
+                    f"`{fpath.relative_to(root)}:{lineno}` — "
+                    f"async `{func_name}` llama a bloqueante `{call}`"
+                ),
+            })
+    return issues
+
+
+def check_long_functions(root: Path) -> list[dict]:
+    issues = []
+    for fpath in _iter_py(root):
+        m = analyze_python_file(fpath)
+        if "error" in m:
+            continue
+        for name, lineno, length in m["function_lengths"]:
+            if length > FUNCTION_LINES_THRESHOLD:
+                issues.append({
+                    "tipo": "funcion-larga", "severidad": "baja",
+                    "archivo": str(fpath.relative_to(root)),
+                    "descripcion": (
+                        f"`{fpath.relative_to(root)}:{lineno}` — "
+                        f"`{name}` tiene {length} líneas "
+                        f"(umbral {FUNCTION_LINES_THRESHOLD})"
+                    ),
+                })
+    return issues
+
+
+def check_circular_imports_issues(root: Path) -> tuple[list[dict], dict]:
+    graph = build_import_graph(root)
+    cycles = find_circular_imports(graph)
+    issues = []
+    for cycle in cycles:
+        issues.append({
+            "tipo": "import-circular", "severidad": "alta",
+            "archivo": cycle[0].replace(".", "/") + ".py",
+            "descripcion": f"Import circular: `{'  →  '.join(cycle)}`",
+        })
+    return issues, graph
+
+
+# ── Escaneo completo ────────────────────────────────────────
 def build_structure(root: Path, depth: int = 0, max_depth: int = 4) -> list:
-    """Construye árbol de estructura recursivo."""
     if depth > max_depth:
         return []
     entries = []
@@ -188,211 +419,257 @@ def build_structure(root: Path, depth: int = 0, max_depth: int = 4) -> list:
     return entries
 
 
-# ─────────────────────────────────────────────
-# Generación del vault de Obsidian
-# ─────────────────────────────────────────────
+def scan_project(root: Path) -> dict:
+    steps = [
+        ("Archivos faltantes",        check_missing_files),
+        ("Directorios vacíos",         check_empty_dirs),
+        ("Archivos grandes",           check_large_files),
+        ("TODOs / FIXMEs",             check_todos),
+        ("Tests",                      check_no_tests),
+        ("Complejidad ciclomática",    check_complexity),
+        ("God Classes",                check_god_classes),
+        ("Async bloqueante",           check_blocking_async),
+        ("Funciones largas",           check_long_functions),
+    ]
+    issues = []
+    for label, fn in steps:
+        print(f"  → {label}...")
+        issues += fn(root)
 
+    print("  → Grafo de imports (AST)...")
+    circular_issues, import_graph = check_circular_imports_issues(root)
+    issues += circular_issues
+
+    return {
+        "proyecto": root.name,
+        "ruta": str(root.resolve()),
+        "fecha": datetime.now().isoformat(timespec="seconds"),
+        "total_issues": len(issues),
+        "issues": issues,
+        "estructura": build_structure(root),
+        "import_graph": {k: list(v) for k, v in import_graph.items()},
+    }
+
+
+# ── Generación del vault ───────────────────────────────────────
 SEVERIDAD_EMOJI = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
 TIPO_ETIQUETA = {
-    "archivo-faltante": "faltante",
-    "directorio-vacio": "estructura",
-    "archivo-grande": "tamaño",
-    "todo-pendiente": "deuda-tecnica",
-    "sin-tests": "calidad",
+    "archivo-faltante":  "faltante",
+    "directorio-vacio":  "estructura",
+    "archivo-grande":    "tamaño",
+    "todo-pendiente":    "deuda-tecnica",
+    "sin-tests":         "calidad",
+    "complejidad-alta":  "complejidad",
+    "god-class":         "god-class",
+    "async-bloqueante":  "async-bug",
+    "import-circular":   "circular",
+    "funcion-larga":     "deuda-tecnica",
 }
 
 
-def structure_to_markdown(items: list, indent: int = 0) -> str:
-    """Convierte la estructura a markdown con árbol de texto."""
+def structure_to_md(items: list, indent: int = 0) -> str:
     lines = []
-    prefix = "  " * indent
     for item in items:
         icon = "📁" if item["tipo"] == "dir" else "📄"
-        lines.append(f"{prefix}- {icon} `{item['nombre']}`")
+        lines.append("  " * indent + f"- {icon} `{item['nombre']}`")
         if item.get("hijos"):
-            lines.append(structure_to_markdown(item["hijos"], indent + 1))
+            lines.append(structure_to_md(item["hijos"], indent + 1))
     return "\n".join(lines)
 
 
-def generate_vault(report: dict, vault_path: Path):
-    """Genera el vault de Obsidian a partir del informe."""
-    vault_path.mkdir(parents=True, exist_ok=True)
+def generate_module_notes(vault_path: Path, import_graph: dict, proyecto: str):
+    if not import_graph:
+        return
+    mods_dir = vault_path / "módulos"
+    mods_dir.mkdir(exist_ok=True)
 
-    # Configuración de Obsidian
+    for mod_name, deps in import_graph.items():
+        short = mod_name.split(".")[-1]
+        dep_links = "\n".join(
+            f"- [[{d.split('.')[-1]}]]" for d in sorted(deps)
+        ) or "_Sin dependencias locales_"
+
+        importers = [
+            m for m, ds in import_graph.items()
+            if mod_name in ds or short in ds
+        ]
+        importer_links = "\n".join(
+            f"- [[{m.split('.')[-1]}]]" for m in sorted(importers)
+        ) or "_No importado por otros módulos_"
+
+        content = (
+            f"---\n"
+            f"tags: [módulo, {proyecto}]\n"
+            f"módulo: {mod_name}\n"
+            f"---\n\n"
+            f"# {short}\n\n"
+            f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  \n"
+            f"#módulo\n\n"
+            f"## Importa\n\n{dep_links}\n\n"
+            f"## Importado por\n\n{importer_links}\n"
+        )
+        (mods_dir / f"{short}.md").write_text(content, encoding="utf-8")
+
+
+def generate_vault(report: dict, vault_path: Path):
+    vault_path.mkdir(parents=True, exist_ok=True)
     obsidian_dir = vault_path / ".obsidian"
     obsidian_dir.mkdir(exist_ok=True)
     write_obsidian_config(obsidian_dir)
 
     proyecto = report["proyecto"]
-    issues = report["issues"]
-    fecha = report["fecha"]
+    issues   = report["issues"]
+    import_graph = report.get("import_graph", {})
 
-    # Agrupar issues por tipo
     by_tipo = defaultdict(list)
     for iss in issues:
         by_tipo[iss["tipo"]].append(iss)
 
-    # Notas de issues (una por tipo)
     issue_notes = []
     for tipo, lista in by_tipo.items():
         note_name = tipo.replace("-", " ").title()
-        note_file = vault_path / f"{note_name}.md"
-        etiqueta = TIPO_ETIQUETA.get(tipo, tipo)
-        lines = [
-            f"# {note_name}",
-            f"",
-            f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  ",
-            f"**Etiqueta:** #{etiqueta}  ",
-            f"**Total:** {len(lista)} problema(s)",
-            f"",
-            f"## Detalle",
-            f"",
-        ]
+        etiqueta  = TIPO_ETIQUETA.get(tipo, tipo)
+        content = (
+            f"---\n"
+            f"tags: [{etiqueta}, auditoria]\n"
+            f"proyecto: {proyecto}\n"
+            f"severidad: {lista[0]['severidad']}\n"
+            f"---\n\n"
+            f"# {note_name}\n\n"
+            f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  \n"
+            f"**Total:** {len(lista)} problema(s)  \n"
+            f"#{etiqueta}\n\n"
+            f"## Detalle\n\n"
+        )
         for iss in lista:
-            emoji = SEVERIDAD_EMOJI.get(iss["severidad"], "⚪")
-            lines.append(f"- {emoji} {iss['descripcion']}")
-        note_file.write_text("\n".join(lines), encoding="utf-8")
+            content += f"- {SEVERIDAD_EMOJI.get(iss['severidad'], '⚪')} {iss['descripcion']}\n"
+        (vault_path / f"{note_name}.md").write_text(content, encoding="utf-8")
         issue_notes.append(note_name)
 
-    # Nota de estructura
-    struct_note = vault_path / "Estructura del Proyecto.md"
-    struct_lines = [
-        f"# Estructura del Proyecto",
-        f"",
-        f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  ",
-        f"#estructura",
-        f"",
-        f"## Árbol de archivos",
-        f"",
-        structure_to_markdown(report["estructura"]),
-    ]
-    struct_note.write_text("\n".join(struct_lines), encoding="utf-8")
+    # Estructura
+    struct = (
+        f"---\ntags: [estructura, auditoria]\nproyecto: {proyecto}\n---\n\n"
+        f"# Estructura del Proyecto\n\n"
+        f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  \n#estructura\n\n"
+        f"## Árbol\n\n{structure_to_md(report['estructura'])}\n"
+    )
+    (vault_path / "Estructura del Proyecto.md").write_text(struct, encoding="utf-8")
 
-    # Nota index principal
-    alta = sum(1 for i in issues if i["severidad"] == "alta")
+    # Grafo de módulos
+    if import_graph:
+        generate_module_notes(vault_path, import_graph, proyecto)
+        dag = (
+            f"---\ntags: [dag, arquitectura]\nproyecto: {proyecto}\n---\n\n"
+            f"# Grafo de Módulos\n\n"
+            f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  \n#dag\n\n"
+            f"Abre la **Vista de Grafo** en Obsidian para ver la red de dependencias.\n\n"
+            f"## Módulos\n\n"
+        )
+        for mod, deps in sorted(import_graph.items()):
+            dag += f"- [[{mod.split('.')[-1]}]] — {len(deps)} dep(s)\n"
+        (vault_path / "Grafo de Módulos.md").write_text(dag, encoding="utf-8")
+        issue_notes.append("Grafo de Módulos")
+
+    # Index principal
+    alta  = sum(1 for i in issues if i["severidad"] == "alta")
     media = sum(1 for i in issues if i["severidad"] == "media")
-    baja = sum(1 for i in issues if i["severidad"] == "baja")
+    baja  = sum(1 for i in issues if i["severidad"] == "baja")
 
-    index_note = vault_path / f"00 - {proyecto} Index.md"
-    index_lines = [
-        f"# {proyecto} — Auditoría",
-        f"",
-        f"**Fecha:** {fecha}  ",
-        f"**Ruta:** `{report['ruta']}`  ",
-        f"#proyecto #auditoria",
-        f"",
-        f"## Resumen",
-        f"",
-        f"| Severidad | Cantidad |",
-        f"|-----------|---------|",
-        f"| 🔴 Alta   | {alta}   |",
-        f"| 🟡 Media  | {media}  |",
-        f"| 🟢 Baja   | {baja}   |",
-        f"| **Total** | **{len(issues)}** |",
-        f"",
-        f"## Notas del vault",
-        f"",
-        f"- [[Estructura del Proyecto]]",
-    ]
+    index = (
+        f"---\ntags: [index, proyecto, auditoria]\nproyecto: {proyecto}\n---\n\n"
+        f"# {proyecto} — Auditoría v2\n\n"
+        f"**Fecha:** {report['fecha']}  \n"
+        f"**Ruta:** `{report['ruta']}`  \n"
+        f"#proyecto #auditoria\n\n"
+        f"## Resumen\n\n"
+        f"| Severidad | Cantidad |\n|-----------|---------:|\n"
+        f"| 🔴 Alta   | {alta}   |\n"
+        f"| 🟡 Media  | {media}  |\n"
+        f"| 🟢 Baja   | {baja}   |\n"
+        f"| **Total** | **{len(issues)}** |\n\n"
+        f"## Análisis incluido\n\n"
+        f"- ✅ Archivos faltantes\n"
+        f"- ✅ Tests ausentes\n"
+        f"- ✅ TODOs / FIXMEs\n"
+        f"- ✅ Archivos grandes\n"
+        f"- ✅ Complejidad ciclomática (AST)\n"
+        f"- ✅ God Classes (AST)\n"
+        f"- ✅ Llamadas bloqueantes en async (AST)\n"
+        f"- ✅ Funciones largas (AST)\n"
+        f"- ✅ Imports circulares + DAG (AST)\n\n"
+        f"## Notas del vault\n\n"
+        f"- [[Estructura del Proyecto]]\n"
+    )
     for note_name in issue_notes:
-        index_lines.append(f"- [[{note_name}]]")
+        index += f"- [[{note_name}]]\n"
+    (vault_path / f"00 - {proyecto} Index.md").write_text(index, encoding="utf-8")
 
-    index_note.write_text("\n".join(index_lines), encoding="utf-8")
-
-    print(f"\n✅ Vault generado en: {vault_path}")
-    print(f"   📝 Notas creadas: {2 + len(issue_notes)}")
+    print(f"\n✅ Vault v2 generado en: {vault_path}")
+    print(f"   📝 Notas: {2 + len(issue_notes) + len(import_graph)}")
     print(f"   🔴 Issues altos: {alta} | 🟡 Medios: {media} | 🟢 Bajos: {baja}")
-    print(f"\n   Abre la carpeta '{vault_path.name}' en Obsidian (Open folder as vault).")
+    print(f"   🔗 Módulos en grafo: {len(import_graph)}")
+    print(f"\n   Abre '{vault_path.name}' en Obsidian → Vista de Grafo")
 
 
 def write_obsidian_config(obsidian_dir: Path):
-    """Escribe la configuración base de Obsidian."""
-    app_config = {
-        "legacyEditor": False,
-        "livePreview": True,
-        "defaultViewMode": "preview",
-        "newFileLocation": "current",
-        "attachmentFolderPath": "assets",
-        "promptDelete": True,
-        "trashOption": "local",
-    }
     (obsidian_dir / "app.json").write_text(
-        json.dumps(app_config, indent=2), encoding="utf-8"
+        json.dumps({
+            "legacyEditor": False, "livePreview": True,
+            "defaultViewMode": "preview", "newFileLocation": "current",
+            "attachmentFolderPath": "assets", "promptDelete": True,
+            "trashOption": "local",
+        }, indent=2), encoding="utf-8"
     )
-
-    graph_config = {
-        "collapse-filter": False,
-        "search": "",
-        "showTags": True,
-        "showAttachments": False,
-        "hideUnresolved": False,
-        "showOrphans": True,
-        "collapse-color-groups": False,
-        "colorGroups": [
-            {"query": "tag:#faltante", "color": {"a": 1, "rgb": 16711680}},
-            {"query": "tag:#deuda-tecnica", "color": {"a": 1, "rgb": 16754944}},
-            {"query": "tag:#calidad", "color": {"a": 1, "rgb": 16776960}},
-            {"query": "tag:#estructura", "color": {"a": 1, "rgb": 3394611}},
-            {"query": "tag:#proyecto", "color": {"a": 1, "rgb": 5614830}},
-        ],
-        "collapse-display": False,
-        "showArrow": True,
-        "textFadeMultiplier": 0,
-        "nodeSizeMultiplier": 1.2,
-        "lineSizeMultiplier": 1,
-        "scale": 1,
-        "close": False,
-        "collapse-forces": False,
-        "centerStrength": 0.518,
-        "repelStrength": 10,
-        "linkStrength": 1,
-        "linkDistance": 250,
-        "animate": False,
-    }
     (obsidian_dir / "graph.json").write_text(
-        json.dumps(graph_config, indent=2), encoding="utf-8"
+        json.dumps({
+            "collapse-filter": False, "search": "", "showTags": True,
+            "showAttachments": False, "hideUnresolved": False,
+            "showOrphans": True, "collapse-color-groups": False,
+            "colorGroups": [
+                {"query": "tag:#async-bug",     "color": {"a": 1, "rgb": 16711680}},
+                {"query": "tag:#circular",      "color": {"a": 1, "rgb": 16711680}},
+                {"query": "tag:#faltante",      "color": {"a": 1, "rgb": 16714512}},
+                {"query": "tag:#complejidad",   "color": {"a": 1, "rgb": 16754944}},
+                {"query": "tag:#god-class",     "color": {"a": 1, "rgb": 16754944}},
+                {"query": "tag:#deuda-tecnica", "color": {"a": 1, "rgb": 16776960}},
+                {"query": "tag:#módulo",       "color": {"a": 1, "rgb": 5614830}},
+                {"query": "tag:#proyecto",      "color": {"a": 1, "rgb": 3394611}},
+            ],
+            "collapse-display": False, "showArrow": True,
+            "textFadeMultiplier": 0, "nodeSizeMultiplier": 1.2,
+            "lineSizeMultiplier": 1, "scale": 1, "close": False,
+            "collapse-forces": False, "centerStrength": 0.518,
+            "repelStrength": 10, "linkStrength": 1, "linkDistance": 250,
+            "animate": False,
+        }, indent=2), encoding="utf-8"
     )
 
 
-# ─────────────────────────────────────────────
-# Entrada principal
-# ─────────────────────────────────────────────
-
+# ── Main ────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Audita un proyecto y genera un vault de Obsidian."
+        description="Audita un proyecto y genera un vault de Obsidian (v2 + AST)."
     )
-    parser.add_argument("proyecto", help="Ruta al proyecto a analizar")
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Ruta de salida del vault (default: ./vault-<nombre-proyecto>)",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="También exportar el informe en JSON",
-    )
+    parser.add_argument("proyecto", help="Ruta al proyecto")
+    parser.add_argument("--output", default=None, help="Carpeta de salida del vault")
+    parser.add_argument("--json", action="store_true", help="Exportar JSON")
     args = parser.parse_args()
 
     root = Path(args.proyecto).resolve()
     if not root.is_dir():
-        print(f"❌ Error: '{root}' no es un directorio válido.", file=sys.stderr)
+        print(f"❌ '{root}' no es un directorio.", file=sys.stderr)
         sys.exit(1)
 
     vault_out = Path(args.output) if args.output else Path(f"vault-{root.name}")
 
     print(f"🔍 Analizando: {root}")
     report = scan_project(root)
-
-    print(f"📊 Encontrados {report['total_issues']} problemas")
+    print(f"📊 Total: {report['total_issues']} problemas")
 
     if args.json:
-        json_path = vault_out.parent / f"{root.name}-auditoria.json"
-        json_path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        print(f"📄 Informe JSON: {json_path}")
+        jp = vault_out.parent / f"{root.name}-auditoria.json"
+        jp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"📄 JSON: {jp}")
 
     generate_vault(report, vault_out)
 
