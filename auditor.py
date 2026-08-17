@@ -79,18 +79,35 @@ class ComplexityVisitor(ast.NodeVisitor):
 
 
 class ImportVisitor(ast.NodeVisitor):
-    """Extrae módulos importados."""
+    """Extrae módulos importados.
+
+    Separa en dos colecciones para evitar falsos positivos:
+    - module_imports: rutas y nombres cortos de módulos reales
+        import app.core.embeddings  →  'app.core.embeddings', 'embeddings'
+        from app.core.embeddings import embed  →  'app.core.embeddings', 'embeddings'
+    - from_names: pares (from_module, name) para 'from X import Y'
+        from app.db.repos import conversations  →  ('app.db.repos', 'conversations')
+        Solo se convierte en dependencia si 'app.db.repos.conversations' existe en canonical.
+    """
 
     def __init__(self):
-        self.imports = set()
+        self.module_imports: set[str] = set()
+        self.from_names: list[tuple[str, str]] = []
 
     def visit_Import(self, node):
         for alias in node.names:
-            self.imports.add(alias.name.split(".")[0])
+            parts = alias.name.split(".")
+            self.module_imports.add(alias.name)   # ruta completa
+            self.module_imports.add(parts[-1])    # nombre corto
 
     def visit_ImportFrom(self, node):
         if node.module:
-            self.imports.add(node.module.split(".")[0])
+            parts = node.module.split(".")
+            self.module_imports.add(node.module)  # ruta completa: 'app.core.embeddings'
+            self.module_imports.add(parts[-1])    # nombre corto: 'embeddings'
+            for alias in node.names:
+                # Registrar par (from_module, name) para resolución exacta posterior
+                self.from_names.append((node.module, alias.name))
 
 
 class GodClassVisitor(ast.NodeVisitor):
@@ -163,7 +180,8 @@ def analyze_python_file(fpath: Path) -> dict:
     iv  = ImportVisitor();          iv.visit(tree)
 
     return {
-        "imports": iv.imports,
+        "module_imports": iv.module_imports,
+        "from_names": iv.from_names,
         "complexity": cv.results,
         "god_classes": gcv.results,
         "blocking_async": abv.results,
@@ -173,8 +191,17 @@ def analyze_python_file(fpath: Path) -> dict:
 
 # ── Grafo de imports ────────────────────────────────────────
 def build_import_graph(root: Path) -> dict[str, set[str]]:
-    """Grafo {modulo_largo: {módulos_locales_que_importa}}."""
-    local_modules: dict[str, Path] = {}
+    """Grafo {modulo_largo: {módulos_locales_que_importa}}.
+
+    Usa el nombre largo (app.core.embeddings) como clave canónica
+    para evitar colisiones entre módulos del mismo nombre corto
+    (e.g. dos archivos admin.py en packages distintos).
+    """
+    # Mapa canónico: nombre_largo → Path (una entrada por archivo)
+    canonical: dict[str, Path] = {}
+    # Alias: nombre_corto → nombre_largo (último en ganar si hay colisión)
+    short_alias: dict[str, str] = {}
+
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for fname in filenames:
@@ -182,16 +209,38 @@ def build_import_graph(root: Path) -> dict[str, set[str]]:
                 fpath = Path(dirpath) / fname
                 rel = fpath.relative_to(root)
                 mod_long = str(rel.with_suffix("")).replace(os.sep, ".")
-                local_modules[mod_long] = fpath
-                local_modules[fname[:-3]] = fpath
+                short = fname[:-3]
+                canonical[mod_long] = fpath
+                short_alias[short] = mod_long  # puede colisionar; se resuelve luego
 
     graph: dict[str, set[str]] = {}
-    for mod_name, fpath in local_modules.items():
-        if "." not in mod_name:
+    for mod_long, fpath in canonical.items():
+        if "." not in mod_long:
             continue
         metrics = analyze_python_file(fpath)
-        imported = metrics.get("imports", set())
-        graph[mod_name] = imported & set(local_modules.keys())
+        module_imports = metrics.get("module_imports", set())
+        from_names     = metrics.get("from_names", [])
+
+        resolved: set[str] = set()
+
+        # 1. Resolver rutas y nombres cortos de módulos reales
+        for imp in module_imports:
+            if imp in canonical:
+                resolved.add(imp)                   # ruta exacta
+            elif imp in short_alias:
+                resolved.add(short_alias[imp])      # nombre corto → ruta larga
+
+        # 2. Resolver 'from X import Y' solo si 'X.Y' es un módulo local real
+        #    Esto evita que variables/funciones (e.g. 'settings' de config.py)
+        #    se confundan con módulos homónimos (e.g. app.workers.settings).
+        for from_mod, name in from_names:
+            full = f"{from_mod}.{name}"
+            if full in canonical:
+                resolved.add(full)
+
+        # Excluir auto-referencia
+        resolved.discard(mod_long)
+        graph[mod_long] = resolved
 
     return graph
 
@@ -477,42 +526,87 @@ def structure_to_md(items: list, indent: int = 0) -> str:
     return "\n".join(lines)
 
 
+def _display_name(mod_long: str) -> str:
+    """Nombre de display: último segmento, prefijado con el paquete si hay colisión."""
+    return mod_long.split(".")[-1]
+
+
+def _note_filename(mod_long: str, seen_shorts: dict[str, list[str]]) -> str:
+    """Devuelve el nombre de archivo desambiguado si hay colisión de nombre corto."""
+    short = mod_long.split(".")[-1]
+    group = seen_shorts.get(short, [])
+    if len(group) <= 1:
+        return short
+    # Disambiguate: use last two segments
+    parts = mod_long.split(".")
+    return f"{parts[-2]}.{parts[-1]}" if len(parts) >= 2 else short
+
+
 def generate_module_notes(vault_path: Path, import_graph: dict, proyecto: str):
     if not import_graph:
         return
     mods_dir = vault_path / "módulos"
     mods_dir.mkdir(exist_ok=True)
 
+    # Detectar colisiones de nombre corto
+    seen_shorts: dict[str, list[str]] = defaultdict(list)
+    for mod_name in import_graph:
+        seen_shorts[mod_name.split(".")[-1]].append(mod_name)
+
+    # Mapa mod_long → filename (para los wikilinks)
+    fn_map = {m: _note_filename(m, seen_shorts) for m in import_graph}
+
     for mod_name, deps in import_graph.items():
+        fname = fn_map[mod_name]
         short = mod_name.split(".")[-1]
+        package = ".".join(mod_name.split(".")[:-1])
+
         dep_links = "\n".join(
-            f"- [[{d.split('.')[-1]}]]" for d in sorted(deps)
+            f"- [[{fn_map.get(d, d.split('.')[-1])}]]" for d in sorted(deps)
         ) or "_Sin dependencias locales_"
 
         importers = [
-            m for m, ds in import_graph.items()
-            if mod_name in ds or short in ds
+            m for m, ds in import_graph.items() if mod_name in ds
         ]
         importer_links = "\n".join(
-            f"- [[{m.split('.')[-1]}]]" for m in sorted(importers)
+            f"- [[{fn_map.get(m, m.split('.')[-1])}]]" for m in sorted(importers)
         ) or "_No importado por otros módulos_"
 
         content = (
             f"---\n"
             f"tags: [módulo, {proyecto}]\n"
             f"módulo: {mod_name}\n"
+            f"paquete: {package}\n"
             f"---\n\n"
             f"# {short}\n\n"
+            f"**Módulo:** `{mod_name}`  \n"
             f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  \n"
             f"#módulo\n\n"
             f"## Importa\n\n{dep_links}\n\n"
             f"## Importado por\n\n{importer_links}\n"
         )
-        (mods_dir / f"{short}.md").write_text(content, encoding="utf-8")
+        (mods_dir / f"{fname}.md").write_text(content, encoding="utf-8")
+
+
+def _clean_stale_notes(vault_path: Path):
+    """Elimina notas de issues y módulos de ejecuciones anteriores."""
+    if not vault_path.exists():
+        return
+    # Limpiar notas de issues en la raíz (excepto el index y Estructura/Grafo)
+    keep = {"00", "Estructura", "Grafo"}
+    for f in vault_path.glob("*.md"):
+        if not any(f.stem.startswith(k) for k in keep):
+            f.unlink()
+    # Limpiar todas las notas de módulos (se regeneran completas)
+    mods_dir = vault_path / "módulos"
+    if mods_dir.exists():
+        for f in mods_dir.glob("*.md"):
+            f.unlink()
 
 
 def generate_vault(report: dict, vault_path: Path):
     vault_path.mkdir(parents=True, exist_ok=True)
+    _clean_stale_notes(vault_path)
     obsidian_dir = vault_path / ".obsidian"
     obsidian_dir.mkdir(exist_ok=True)
     write_obsidian_config(obsidian_dir)
@@ -558,15 +652,24 @@ def generate_vault(report: dict, vault_path: Path):
     # Grafo de módulos
     if import_graph:
         generate_module_notes(vault_path, import_graph, proyecto)
+
+        # Detectar colisiones para el Grafo de Módulos también
+        seen_shorts_dag: dict[str, list[str]] = defaultdict(list)
+        for mod in import_graph:
+            seen_shorts_dag[mod.split(".")[-1]].append(mod)
+        fn_map_dag = {m: _note_filename(m, seen_shorts_dag) for m in import_graph}
+
         dag = (
             f"---\ntags: [dag, arquitectura]\nproyecto: {proyecto}\n---\n\n"
             f"# Grafo de Módulos\n\n"
             f"**Proyecto:** [[00 - {proyecto} Index|{proyecto}]]  \n#dag\n\n"
             f"Abre la **Vista de Grafo** en Obsidian para ver la red.\n\n"
-            f"## Módulos\n\n"
+            f"## Módulos ({len(import_graph)})\n\n"
         )
         for mod, deps in sorted(import_graph.items()):
-            dag += f"- [[{mod.split('.')[-1]}]] — {len(deps)} dep(s)\n"
+            fn = fn_map_dag[mod]
+            pkg = ".".join(mod.split(".")[:-1])
+            dag += f"- [[{fn}]] `{pkg}` — {len(deps)} dep(s)\n"
         (vault_path / "Grafo de Módulos.md").write_text(dag, encoding="utf-8")
         issue_notes.append("Grafo de Módulos")
 
